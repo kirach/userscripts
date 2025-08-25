@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Gmail: Subscriptions — Purge & Unsubscribe
+// @name         Gmail: Subscriptions — Purge & Unsubscribe (observer)
 // @namespace    gmail-subscriptions
 // @version      0.1
-// @description  On "Manage subscriptions", adds a button to purge all messages for a sender (across pages) and then unsubscribe.
+// @description  Add a button per subscription on the Manage Subscriptions page.
 // @match        https://mail.google.com/*
 // @run-at       document-idle
 // @grant        none
@@ -11,255 +11,190 @@
 ;(function () {
   'use strict'
 
-  // ======== CONFIG ========
-  const CONFIG = {
-    // Detect “Manage subscriptions” page
-    subscriptionsHeading: 'Subscriptions', // visible heading text on the page
+  const log = (...a) => console.log('[subs]', ...a)
+  const isSubs = () => (location.hash || '').startsWith('#sub')
+  const isVisible = (el) => !!el && el.offsetParent !== null
 
-    // Button label we inject
-    actionLabel: 'Purge + Unsub',
-
-    // Labels/buttons on message list pages
-    selectAllBanner: 'Select all conversations that match this search',
-    deleteAria: 'Delete',
-
-    // Paginator controls (Gmail list view)
-    olderAria: 'Older',
-    newerAria: 'Newer',
-
-    // Toolbar container (message list)
-    toolbarSelector: "div[gh='mtb']",
-
-    // Confirmations
-    confirmStart: (name) =>
-      `Purge ALL emails for “${name}” and then unsubscribe?\n\nEmails will move to Trash (recoverable for 30 days).`,
-
-    doneMsg: (name, usedBanner, pages) =>
-      `Done with “${name}”.\n• Deletion: ${usedBanner ? 'All in one go via banner' : `Paginated: ${pages} page(s)`}\n• Unsubscribe attempted.`,
-  }
-
-  // ======== UTILITIES ========
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-
-  let x = 'test'
-
-  const foo = [1, 2, 3].map((x) => x + 1)
-  console.log(foo)
-
-  const waitFor = (selector, { root = document, timeoutMs = 15000 } = {}) =>
-    new Promise((resolve, reject) => {
-      const found = root.querySelector(selector)
-      if (found) return resolve(found)
-      const obs = new MutationObserver(() => {
-        const el = root.querySelector(selector)
-        if (el) {
-          obs.disconnect()
-          resolve(el)
-        }
-      })
-      obs.observe(root, { childList: true, subtree: true })
-      setTimeout(() => {
-        obs.disconnect()
-        reject(new Error('Timeout waiting for ' + selector))
-      }, timeoutMs)
-    })
-
-  const queryByText = (selector, text, { root = document } = {}) => {
-    text = (text || '').toLowerCase()
-    return (
-      [...root.querySelectorAll(selector)].find((el) =>
-        (el.textContent || '').trim().toLowerCase().includes(text)
-      ) || null
-    )
-  }
-
-  const isSubscriptionsPage = () => {
-    console.log(' >>> isSubscriptionsPage')
-    const hash = location.hash || ''
-    console.log(' >>> hash=', hash)
-    if (/#.*subscriptions/i.test(hash)) return true
-    const heading = queryByText('h2, h1, div, span', CONFIG.subscriptionsHeading)
-    return !!heading && /subscriptions/i.test(heading.textContent || '')
-  }
-
-  // ======== INJECT BUTTONS ON SUBSCRIPTIONS LIST ========
-  function injectButtonsOnSubscriptions() {
-    if (!isSubscriptionsPage()) return
-
-    const rows = document.querySelectorAll('a, div[role="link"], div[role="button"]')
-    for (const row of rows) {
-      if (!row.offsetParent) continue
-      const li = row.closest('[role="listitem"], .subscription, .nH, .aDP, div')
-      if (!li) continue
-
-      const name = (row.textContent || '').trim()
-      if (!name) continue
-
-      if (li.querySelector('.gm-sub-purge-btn')) continue
-
-      const btn = document.createElement('button')
-      btn.className = 'gm-sub-purge-btn'
-      btn.textContent = CONFIG.actionLabel
-      Object.assign(btn.style, {
-        marginLeft: '8px',
-        padding: '4px 8px',
-        border: '1px solid #dadce0',
-        borderRadius: '6px',
-        cursor: 'pointer',
-        fontSize: '12px',
-      })
-
-      btn.addEventListener('click', async (ev) => {
-        ev.stopPropagation()
-        ev.preventDefault()
-        try {
-          if (!confirm(CONFIG.confirmStart(name))) return
-
-          const subscriptionsUrl = location.href
-          row.click()
-
-          const { usedBanner, pagesProcessed } = await purgeAllOnCurrentList()
-
-          history.back()
-          await sleep(600)
-          if (!isSubscriptionsPage()) {
-            history.back()
-            await sleep(800)
-            if (!isSubscriptionsPage()) {
-              location.assign(subscriptionsUrl)
-              await waitFor(() => isSubscriptionsPage(), { timeoutMs: 8000 }).catch(() => {})
-            }
-          }
-
-          await tryUnsubscribeOnList(name)
-          alert(CONFIG.doneMsg(name, usedBanner, pagesProcessed))
-        } catch (e) {
-          console.error(e)
-          alert('Error: ' + e.message)
-        }
-      })
-      ;(li || row).appendChild(btn)
-    }
-  }
-
-  // ======== PURGE ALL ON CURRENT MESSAGE LIST ========
-  async function purgeAllOnCurrentList() {
-    await waitFor("div[role='main']")
-    await waitFor(CONFIG.toolbarSelector)
-
-    const main = document.querySelector("div[role='main']")
-    const pageCheckbox = main && main.querySelector("span[role='checkbox'][aria-label]")
-    if (!pageCheckbox) throw new Error('Could not find the page checkbox.')
-    pageCheckbox.click()
-    await sleep(300)
-
-    const bannerLink = queryByText('span', CONFIG.selectAllBanner)
-    if (bannerLink && bannerLink.offsetParent) {
-      bannerLink.click()
-      await sleep(250)
-      await clickDelete()
-      return { usedBanner: true, pagesProcessed: 1 }
-    }
-
-    let pages = 0
-    await clickDelete()
-    pages++
-
-    while (true) {
-      const older = findPaginator(CONFIG.olderAria)
-      if (
-        !older ||
-        older.getAttribute('aria-disabled') === 'true' ||
-        (older.getAttribute('aria-disabled') === 'false' && !older.offsetParent)
-      ) {
-        break
+  function injectStylesOnce() {
+    if (document.getElementById('gm-sub-btn-styles')) return
+    const css = `
+      .gm-sub-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 28px;
+        padding: 0 10px;
+        border: 1px solid #dadce0;
+        border-radius: 16px;
+        background: #fff;
+        color: #1f1f1f;
+        font: 500 12px/28px system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        cursor: pointer;
+        user-select: none;
+        vertical-align: middle;
+        transition: background-color .12s ease, box-shadow .12s ease, border-color .12s ease, color .12s ease;
       }
-      older.click()
-      await waitFor("div[role='main']")
-      await sleep(450)
-
-      const main2 = document.querySelector("div[role='main']")
-      const pageCheckbox2 = main2 && main2.querySelector("span[role='checkbox'][aria-label]")
-      if (!pageCheckbox2) break
-      pageCheckbox2.click()
-      await sleep(200)
-
-      await clickDelete()
-      pages++
-    }
-    return { usedBanner: false, pagesProcessed: pages }
-  }
-
-  async function clickDelete() {
-    let delBtn = document.querySelector(
-      `div[aria-label='${CONFIG.deleteAria}'], div[aria-label='${CONFIG.deleteAria} selected conversations']`
-    )
-    if (!delBtn) {
-      delBtn = [
-        ...document.querySelectorAll(
-          `${CONFIG.toolbarSelector} [aria-label], ${CONFIG.toolbarSelector} [data-tooltip]`
-        ),
-      ].find((el) =>
-        /delete/i.test(el.getAttribute('aria-label') || el.getAttribute('data-tooltip') || '')
-      )
-    }
-    if (!delBtn) throw new Error('Delete button not found.')
-    delBtn.click()
-    await sleep(800)
-  }
-
-  function findPaginator(ariaLabelText) {
-    const toolbar = document.querySelector(CONFIG.toolbarSelector)
-    if (!toolbar) return null
-    const byAria = [...toolbar.querySelectorAll('[aria-label]')].find((el) => {
-      const aria = (el.getAttribute('aria-label') || '').toLowerCase()
-      return aria.includes(ariaLabelText.toLowerCase())
-    })
-    if (byAria) return byAria
-
-    const byTooltip = [...toolbar.querySelectorAll('[data-tooltip]')].find((el) => {
-      const tip = (el.getAttribute('data-tooltip') || '').toLowerCase()
-      return tip.includes(ariaLabelText.toLowerCase())
-    })
-    return byTooltip || null
-  }
-
-  async function tryUnsubscribeOnList(name) {
-    for (let i = 0; i < 20; i++) {
-      if (isSubscriptionsPage()) break
-      await sleep(300)
-    }
-    if (!isSubscriptionsPage()) return false
-
-    const candidates = [...document.querySelectorAll('[role="listitem"], a, div')].filter(
-      (el) =>
-        el.offsetParent && (el.textContent || '').toLowerCase().includes((name || '').toLowerCase())
-    )
-    if (!candidates.length) return false
-
-    for (const el of candidates) {
-      const container = el.closest('[role="listitem"]') || el
-      const unsub = [...container.querySelectorAll('button, a, div, span')].find((n) => {
-        if (!n.offsetParent) return false
-        const t = (n.textContent || '').toLowerCase()
-        const aria = (n.getAttribute('aria-label') || '').toLowerCase()
-        return /unsubscribe/.test(t) || /unsubscribe/.test(aria)
-      })
-      if (unsub) {
-        unsub.click()
-        return true
+      .gm-sub-btn:hover {
+        background: rgba(60,64,67,0.08);
       }
-    }
-    return false
+      .gm-sub-btn:active {
+        background: rgba(60,64,67,0.16);
+      }
+      .gm-sub-btn:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px rgba(26,115,232,0.3);
+        border-color: #1a73e8;
+      }
+      .gm-sub-btn[disabled] {
+        opacity: .55;
+        cursor: default;
+      }
+      .gm-sub-btn .gm-sub-icon {
+        font-size: 14px;
+        line-height: 1;
+      }
+
+      /* Dark mode tweak */
+      @media (prefers-color-scheme: dark) {
+        .gm-sub-btn {
+          background: #2a2a2a;
+          color: #e8eaed;
+          border-color: #3c4043;
+        }
+        .gm-sub-btn:hover { background: rgba(232,234,237,0.08); }
+        .gm-sub-btn:active { background: rgba(232,234,237,0.16); }
+      }
+    `
+    const style = document.createElement('style')
+    style.id = 'gm-sub-btn-styles'
+    style.textContent = css
+    document.head.appendChild(style)
   }
 
-  function observeSubscriptions() {
-    const obs = new MutationObserver(() => {
-      if (isSubscriptionsPage()) injectButtonsOnSubscriptions()
+  function findUnsubscribeButton(row) {
+    if (!row) return null
+
+    // Prefer a visible button with visible text "Unsubscribe"
+    const textBtn = [...row.querySelectorAll('button,[role="button"]')].find((el) => {
+      if (!isVisible(el)) return false
+      const t = (el.textContent || '').trim().toLowerCase()
+      return t === 'unsubscribe' || t.startsWith('unsubscribe ')
     })
-    obs.observe(document.documentElement, { childList: true, subtree: true })
+    if (textBtn) return textBtn
+
+    // Fallback: a visible button with aria-label "Unsubscribe"
+    const ariaBtn = [...row.querySelectorAll('button[aria-label],[role="button"][aria-label]')].find(
+      (el) => isVisible(el) && /unsubscribe/i.test(el.getAttribute('aria-label') || '')
+    )
+    if (ariaBtn) return ariaBtn
+
+    return null
   }
 
-  observeSubscriptions()
-  injectButtonsOnSubscriptions()
+  function findUnsubscribeCell(row) {
+    // The cell in your snippet is: <td role="gridcell"> ... (buttons) ... </td>
+    // Find a gridcell that contains an Unsubscribe button
+    const cells = row.querySelectorAll('td[role="gridcell"], [role="gridcell"]')
+    for (const cell of cells) {
+      const btn = findUnsubscribeButton(cell)
+      if (btn) return { cell, btn }
+    }
+    // Fallback: search whole row
+    const btn = findUnsubscribeButton(row)
+    return btn ? { cell: btn.closest('td,[role="gridcell"]') || row, btn } : null
+  }
+
+  // Create the small action button
+  function makeBtn() {
+    const btn = document.createElement('button')
+    btn.className = 'gm-sub-btn'
+    // Optional: small emoji icon that fits Gmail vibe
+    const icon = document.createElement('span')
+    icon.className = 'gm-sub-icon'
+    icon.textContent = '🧹' // or '🗑️' / '✉️'
+    const label = document.createElement('span')
+    label.textContent = 'Purge + Unsub'
+    btn.append(icon, label)
+    return btn
+  }
+
+  // Enhance a single row exactly once
+  function enhanceRow(row) {
+    if (!row || row.dataset.gmInjected === '1') return
+
+    const btn = makeBtn()
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation()
+      ev.preventDefault()
+      log('clicked purge for:', (row.textContent || '').trim().slice(0, 120))
+      // TODO: open sender search -> purge -> back -> unsubscribe
+    })
+
+    const unsub = findUnsubscribeCell(row)
+    if (unsub) {
+      // Place right after the native Unsubscribe button
+      unsub.btn.insertAdjacentElement('afterend', btn)
+    } else {
+      // Fallback: append to the row end if the structure changes
+      row.appendChild(btn)
+    }
+
+    row.dataset.gmInjected = '1'
+  }
+
+  // Scan current rows and enhance
+  function enhanceAllRows() {
+    const main = document.querySelector('div[role="main"]')
+    if (!main) return
+    const rows = main.querySelectorAll('[role="row"]')
+    let injected = 0
+    rows.forEach((r) => {
+      const before = r.dataset.gmInjected === '1'
+      enhanceRow(r)
+      if (!before && r.dataset.gmInjected === '1') injected++
+    })
+    if (injected) log('enhanced rows:', injected)
+  }
+
+  // Observer management
+  let observer = null
+
+  function startObserver() {
+    if (observer) return
+    const main = document.querySelector('div[role="main"]')
+    if (!main) {
+      // main not ready yet; try once shortly after
+      setTimeout(startObserver, 200)
+      return
+    }
+    observer = new MutationObserver(() => {
+      // minimal debounce to batch bursts
+      if (startObserver._t) clearTimeout(startObserver._t)
+      startObserver._t = setTimeout(enhanceAllRows, 80)
+    })
+    observer.observe(main, { childList: true, subtree: true })
+    enhanceAllRows() // initial pass
+    log('observer started')
+  }
+
+  function stopObserver() {
+    if (!observer) return
+    observer.disconnect()
+    observer = null
+    log('observer stopped')
+  }
+
+  // Initial load
+  if (isSubs()) startObserver()
+
+  injectStylesOnce()
+
+  // React to SPA navigation
+  window.addEventListener('hashchange', () => {
+    if (isSubs()) {
+      startObserver()
+    } else {
+      stopObserver()
+    }
+  })
 })()
