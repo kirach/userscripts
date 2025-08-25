@@ -151,12 +151,21 @@
 
     const ourBtn = makeBtn()
 
-    // Wire up click (placeholder for your full flow)
     ourBtn.addEventListener('click', async (ev) => {
       ev.stopPropagation()
       ev.preventDefault()
-      // TODO: implement your purge flow here
-      alert('Purge flow not implemented yet for this sender.')
+      try {
+        ourBtn.disabled = true
+        ourBtn.textContent = 'Working…'
+        await runSelectOnlyFlowForRow(row)
+        ourBtn.textContent = 'Done ✓'
+      } catch (e) {
+        console.error('[subs] test-flow error:', e)
+        alert('Error: ' + (e?.message || e))
+        ourBtn.textContent = 'Purge + Unsub'
+      } finally {
+        ourBtn.disabled = false
+      }
     })
 
     // Try to place right after the native Unsubscribe control
@@ -242,4 +251,187 @@
       stopObserver()
     }
   })
+
+  /*
+   * --- purge flow for a subscription -----------------------------------------
+   */
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  const q = (sel, root = document) => root.querySelector(sel)
+  const qq = (sel, root = document) => Array.from(root.querySelectorAll(sel))
+  const textOf = (el) => (el?.textContent || '').trim()
+
+  function waitFor(selector, { root = document, timeout = 15000 } = {}) {
+    return new Promise((resolve, reject) => {
+      const found = root.querySelector(selector)
+      if (found) return resolve(found)
+      const obs = new MutationObserver(() => {
+        const el = root.querySelector(selector)
+        if (el) {
+          obs.disconnect()
+          resolve(el)
+        }
+      })
+      obs.observe(root, { childList: true, subtree: true })
+      setTimeout(() => {
+        obs.disconnect()
+        reject(new Error('Timeout: ' + selector))
+      }, timeout)
+    })
+  }
+
+  // Toolbar buttons by aria-label or tooltip
+  function findToolbarButton(regex) {
+    const tb = q('div[gh="mtb"]') || document
+    const candidates = qq('[aria-label],[data-tooltip]', tb)
+    return candidates.find((el) => regex.test(el.getAttribute('aria-label') || el.getAttribute('data-tooltip') || ''))
+  }
+
+  // “Select page” checkbox
+  function findPageCheckbox() {
+    const main = q('div[role="main"]')
+    if (!main) return null
+    const cands = qq('[role="checkbox"]', main).filter((el) => el.offsetParent !== null)
+    // Prefer ones that say “Select”
+    return cands.find((el) => /select/i.test(el.getAttribute('aria-label') || '')) || cands[0] || null
+  }
+
+  // Banner: “Select all conversations that match this search”
+  function findSelectAllBannerLink() {
+    const main = q('div[role="main"]') || document
+    const link = qq('a, span', main).find((el) => /select all conversations that match this search/i.test(textOf(el)))
+    return link && link.offsetParent ? link : null
+  }
+
+  // Older pagination
+  function clickOlderIfPossible() {
+    const older = findToolbarButton(/older/i)
+    if (!older || older.getAttribute('aria-disabled') === 'true') return false
+    older.click()
+    return true
+  }
+
+  // Get row email and open search
+  function getRowEmail(row) {
+    const attr = row.getAttribute('data-row-id')
+    if (attr) return attr.trim()
+    const dataEmail = row.querySelector('[data-email]')?.getAttribute('data-email')
+    if (dataEmail) return dataEmail.trim()
+    const m = textOf(row).match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)
+    return m ? m[0] : null
+  }
+
+  function openSenderSearchFromRow(row) {
+    const link = row.querySelector('a[href*="#search/"]')
+    if (link) {
+      link.click()
+      return true
+    }
+    const email = getRowEmail(row)
+    if (!email) return false
+    const m = location.pathname.match(/\/mail\/u\/(\d+)\//)
+    const u = m ? m[1] : '0'
+    location.href = `https://mail.google.com/mail/u/${u}/#search/from:${encodeURIComponent(email)}`
+    return true
+  }
+
+  // Back to subscriptions
+  async function goBackToSubscriptions(maxSteps = 4) {
+    for (let i = 0; i < maxSteps; i++) {
+      if ((location.hash || '').startsWith('#sub')) return true
+      history.back()
+      await sleep(600)
+    }
+    return (location.hash || '').startsWith('#sub')
+  }
+
+  // Click native Unsubscribe on the row by email (no confirm)
+  async function clickUnsubscribeOnEmail(email) {
+    const main = q('div[role="main"]')
+    if (!main) return false
+
+    const row = main.querySelector(`[role="row"][data-row-id="${CSS.escape(email)}"]`)
+    if (!row) return false
+
+    // Reuse your existing finder (we assume findUnsubscribeButton/findUnsubscribeCell exist)
+    const cells = row.querySelectorAll('td[role="gridcell"], [role="gridcell"]')
+    for (const cell of cells) {
+      const btn =
+        [...cell.querySelectorAll('button,[role="button"]')].find(
+          (el) => el.offsetParent !== null && /^unsubscribe\b/i.test(textOf(el))
+        ) ||
+        [...cell.querySelectorAll('button[aria-label],[role="button"][aria-label]')].find(
+          (el) => el.offsetParent !== null && /unsubscribe/i.test(el.getAttribute('aria-label') || '')
+        )
+      if (btn) {
+        btn.click()
+        await sleep(400)
+        return true
+      }
+    }
+    return false
+  }
+
+  // Put this near the top of your helpers
+  const STEP_DELAY = 3000 // milliseconds, adjust as needed
+
+  // Replace runSelectOnlyFlowForRow with this version
+  async function runSelectOnlyFlowForRow(row) {
+    const senderEmail = getRowEmail(row)
+    if (!openSenderSearchFromRow(row)) {
+      throw new Error('Could not open sender search for this row')
+    }
+
+    // Wait for list view
+    await waitFor('div[role="main"]')
+    await waitFor('div[gh="mtb"]')
+    await sleep(STEP_DELAY)
+
+    // Select all on current page
+    const pageCb = findPageCheckbox()
+    if (pageCb) {
+      pageCb.click()
+      console.log('[subs] clicked page checkbox')
+      await sleep(STEP_DELAY)
+    }
+
+    // If banner appears, click it
+    const banner = findSelectAllBannerLink()
+    if (banner) {
+      banner.click()
+      console.log('[subs] clicked select-all banner')
+      await sleep(STEP_DELAY)
+    } else {
+      // Walk through Older pages
+      let moved = true
+      let page = 1
+      while (moved) {
+        moved = clickOlderIfPossible()
+        if (!moved) break
+        page++
+        console.log(`[subs] moved to page ${page}`)
+        await waitFor('div[gh="mtb"]')
+        await sleep(STEP_DELAY)
+        const cb = findPageCheckbox()
+        if (cb) {
+          cb.click()
+          console.log(`[subs] clicked page checkbox on page ${page}`)
+          await sleep(STEP_DELAY)
+        }
+      }
+    }
+
+    // Go back to subscriptions
+    await goBackToSubscriptions(4)
+    console.log('[subs] navigated back to subscriptions')
+    await waitFor('div[role="main"]')
+    await sleep(STEP_DELAY)
+
+    // Click native Unsubscribe for that sender (no confirm)
+    if (senderEmail) {
+      await clickUnsubscribeOnEmail(senderEmail)
+      console.log('[subs] clicked unsubscribe button')
+      await sleep(STEP_DELAY)
+    }
+  }
 })()
