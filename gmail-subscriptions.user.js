@@ -157,7 +157,7 @@
       try {
         ourBtn.disabled = true
         ourBtn.textContent = 'Working…'
-        await runSelectOnlyFlowForRow(row)
+        await runPurgeFlowForRow(row)
         ourBtn.textContent = 'Done ✓'
       } catch (e) {
         console.error('[subs] test-flow error:', e)
@@ -375,8 +375,81 @@
   // Put this near the top of your helpers
   const STEP_DELAY = 3000 // milliseconds, adjust as needed
 
-  // Replace runSelectOnlyFlowForRow with this version
-  async function runSelectOnlyFlowForRow(row) {
+  // Try to click like a human: pointer + mouse sequence at the element's center
+  async function humanClick(el) {
+    console.log('[subs] humanClick', el)
+
+    if (!el) return false
+    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
+    el.focus?.()
+
+    const r = el.getBoundingClientRect()
+    const x = Math.floor(r.left + r.width / 2)
+    const y = Math.floor(r.top + r.height / 2)
+
+    const base = {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: x,
+      clientY: y,
+      button: 0,
+      buttons: 1,
+      composed: true,
+    }
+
+    // Pointer events first (Gmail often listens to pointerdown/up)
+    el.dispatchEvent(new PointerEvent('pointerover', { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true }))
+    el.dispatchEvent(new MouseEvent('mouseover', base))
+    el.dispatchEvent(new PointerEvent('pointerdown', { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true }))
+    el.dispatchEvent(new MouseEvent('mousedown', base))
+    el.dispatchEvent(new PointerEvent('pointerup', { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true }))
+    el.dispatchEvent(new MouseEvent('mouseup', base))
+    el.dispatchEvent(new MouseEvent('click', base))
+    await sleep(STEP_DELAY)
+    return true
+  }
+
+  // Use the exact toolbar markup you shared
+  async function clickDelete() {
+    // Prefer the explicit aria/tooltip Delete in the toolbar
+    const tb = q('div[gh="mtb"]') || document
+    let delBtn = tb.querySelector('[role="button"][aria-label="Delete"], [role="button"][data-tooltip="Delete"]')
+
+    if (!delBtn) {
+      // Fallback: scan visible role=button candidates for Delete text/tooltip (just in case)
+      delBtn = qq('[role="button"][aria-label], [role="button"][data-tooltip]', tb)
+        .filter((el) => el.offsetParent !== null)
+        .find((el) => /delete/i.test(el.getAttribute('aria-label') || el.getAttribute('data-tooltip') || ''))
+    }
+    if (!delBtn) {
+      console.warn('[subs] Delete button not found.')
+      return false
+    }
+    if (delBtn.getAttribute('aria-disabled') === 'true') {
+      console.warn('[subs] Delete button is disabled.')
+      return false
+    }
+
+    // 1) native click on the container
+    delBtn.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
+    delBtn.focus?.()
+    delBtn.click()
+    await sleep(STEP_DELAY)
+
+    // If that didn’t trigger, try the inner hit target (the <div class="Bn">Delete</div> you showed)
+    const inner = delBtn.querySelector('.Bn')
+    if (inner) {
+      inner.click()
+      await sleep(STEP_DELAY)
+    }
+
+    // 3) Fallback: simulate full pointer/mouse sequence
+    await humanClick(delBtn)
+    return true
+  }
+
+  async function runPurgeFlowForRow(row) {
     const senderEmail = getRowEmail(row)
     if (!openSenderSearchFromRow(row)) {
       throw new Error('Could not open sender search for this row')
@@ -395,23 +468,40 @@
       await sleep(STEP_DELAY)
     }
 
-    // If banner appears, click it
+    // If banner appears, select all conversations
     const banner = findSelectAllBannerLink()
     if (banner) {
       banner.click()
       console.log('[subs] clicked select-all banner')
       await sleep(STEP_DELAY)
+
+      // Delete all at once
+      const ok = await clickDelete()
+      if (!ok) throw new Error('Delete button not found')
+
+      console.log('[subs] clicked delete for all conversations')
+      await sleep(STEP_DELAY)
     } else {
-      // Walk through Older pages
-      let moved = true
+      // Otherwise, page through and delete per page
       let page = 1
-      while (moved) {
-        moved = clickOlderIfPossible()
-        if (!moved) break
+      let keepGoing = true
+
+      while (keepGoing) {
+        const ok = await clickDelete()
+        if (!ok) throw new Error('Delete button not found')
+
+        console.log(`[subs] clicked delete on page ${page}`)
+        await sleep(STEP_DELAY)
+
+        // Try Older
+        keepGoing = clickOlderIfPossible()
+        if (!keepGoing) break
         page++
         console.log(`[subs] moved to page ${page}`)
         await waitFor('div[gh="mtb"]')
         await sleep(STEP_DELAY)
+
+        // Select all on this page
         const cb = findPageCheckbox()
         if (cb) {
           cb.click()
