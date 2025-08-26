@@ -148,38 +148,36 @@
   // --- enhance a single row exactly once ------------------------------------
   function enhanceRow(row) {
     if (!row || row.dataset.gmInjected === '1') return
-
-    const ourBtn = makeBtn()
-
-    ourBtn.addEventListener('click', async (ev) => {
+    const purgeAndUnsubscribeBtn = makeBtn()
+    purgeAndUnsubscribeBtn.addEventListener('click', async (ev) => {
       ev.stopPropagation()
       ev.preventDefault()
       try {
-        ourBtn.disabled = true
-        ourBtn.textContent = 'Working…'
+        purgeAndUnsubscribeBtn.disabled = true
+        purgeAndUnsubscribeBtn.textContent = 'Working…'
         await runPurgeFlowForRow(row)
-        ourBtn.textContent = 'Done ✓'
+        purgeAndUnsubscribeBtn.textContent = 'Done ✓'
       } catch (e) {
         console.error('[subs] test-flow error:', e)
         alert('Error: ' + (e?.message || e))
-        ourBtn.textContent = 'Purge + Unsub'
+        purgeAndUnsubscribeBtn.textContent = 'Purge + Unsub'
       } finally {
-        ourBtn.disabled = false
+        purgeAndUnsubscribeBtn.disabled = false
       }
     })
 
     // Try to place right after the native Unsubscribe control
     const unsub = findUnsubscribeCell(row)
     if (unsub && unsub.btn && unsub.btn.insertAdjacentElement) {
-      unsub.btn.insertAdjacentElement('afterend', ourBtn)
+      unsub.btn.insertAdjacentElement('afterend', purgeAndUnsubscribeBtn)
 
       // Register our button with the anchor and sync size now
       const entry = attachAnchorObserver(unsub.btn)
-      entry.buttons.add(ourBtn)
+      entry.buttons.add(purgeAndUnsubscribeBtn)
       syncForAnchor(unsub.btn)
     } else {
       // Fallback: append at end of row
-      row.appendChild(ourBtn)
+      row.appendChild(purgeAndUnsubscribeBtn)
     }
 
     row.dataset.gmInjected = '1'
@@ -321,17 +319,31 @@
     return m ? m[0] : null
   }
 
-  function openSenderSearchFromRow(row) {
-    const link = row.querySelector('a[href*="#search/"]')
-    if (link) {
-      link.click()
-      return true
+  async function openSenderSearchFromRow(row) {
+    if (!row) return false
+
+    // Prefer the element that has Gmail's click handler
+    let target =
+      (row.matches('[jsaction*="w59Wgc"]') ? row : row.querySelector('[jsaction*="w59Wgc"]')) ||
+      // Fallback: try a “name/email” cell (avoid the unsubscribe cell)
+      row.querySelector('td[role="gridcell"]:nth-child(2)') ||
+      row.querySelector('td[role="gridcell"]:nth-child(3)') ||
+      row
+
+    // Try a human-like click on the row/handler
+    await humanClick(target)
+    // Give Gmail time to route into the search view
+    await sleep(STEP_DELAY)
+
+    // If it didn’t navigate (hash still starts with #sub), fall back to building the search URL
+    if ((location.hash || '').startsWith('#sub')) {
+      const email = getRowEmail(row)
+      if (!email) return false
+      const m = location.pathname.match(/\/mail\/u\/(\d+)\//)
+      const u = m ? m[1] : '0'
+      location.href = `https://mail.google.com/mail/u/${u}/#search/from:${encodeURIComponent(email)}`
+      await sleep(STEP_DELAY)
     }
-    const email = getRowEmail(row)
-    if (!email) return false
-    const m = location.pathname.match(/\/mail\/u\/(\d+)\//)
-    const u = m ? m[1] : '0'
-    location.href = `https://mail.google.com/mail/u/${u}/#search/from:${encodeURIComponent(email)}`
     return true
   }
 
@@ -373,7 +385,7 @@
   }
 
   // Put this near the top of your helpers
-  const STEP_DELAY = 3000 // milliseconds, adjust as needed
+  const STEP_DELAY = 1000 // milliseconds, adjust as needed
 
   // Try to click like a human: pointer + mouse sequence at the element's center
   async function humanClick(el) {
@@ -410,7 +422,49 @@
     return true
   }
 
-  // Use the exact toolbar markup you shared
+  function findBulkDialog() {
+    // Gmail uses role="alertdialog" on the modal container
+    const dlg = document.querySelector('[role="alertdialog"][aria-modal="true"]')
+    return dlg && dlg.offsetParent !== null ? dlg : null
+  }
+
+  function findBulkOkButton(dlg) {
+    if (!dlg) return null
+    // Prefer explicit MDC attributes
+    let ok =
+      dlg.querySelector('button[data-mdc-dialog-action="ok"]') ||
+      dlg.querySelector('button[data-mdc-dialog-button-default]') ||
+      dlg.querySelector('button[data-mdc-dialog-initial-focus]')
+    if (ok) return ok
+
+    // Fallback: a visible button whose text is "OK" / "Continue" / "Confirm"
+    ok = Array.from(dlg.querySelectorAll('button,[role="button"]')).find((el) => {
+      if (!el || el.offsetParent === null) return false
+      const t = (el.textContent || '').trim().toLowerCase()
+      return t === 'ok' || t === 'continue' || t === 'confirm'
+    })
+    return ok || null
+  }
+
+  // Wait briefly for the dialog to appear, then click OK if found
+  async function confirmBulkIfNeeded({ waitMs = 2000 } = {}) {
+    const start = Date.now()
+    while (Date.now() - start < waitMs) {
+      const dlg = findBulkDialog()
+      if (dlg) {
+        const ok = findBulkOkButton(dlg)
+        if (ok) {
+          ok.click()
+          console.log('[subs] bulk confirm: clicked OK')
+          await sleep(STEP_DELAY)
+          return true
+        }
+      }
+      await sleep(120)
+    }
+    return false
+  }
+
   async function clickDelete() {
     // Prefer the explicit aria/tooltip Delete in the toolbar
     const tb = q('div[gh="mtb"]') || document
@@ -451,9 +505,8 @@
 
   async function runPurgeFlowForRow(row) {
     const senderEmail = getRowEmail(row)
-    if (!openSenderSearchFromRow(row)) {
-      throw new Error('Could not open sender search for this row')
-    }
+    const ok = await openSenderSearchFromRow(row)
+    if (!ok) throw new Error('Could not open sender search for this row')
 
     // Wait for list view
     await waitFor('div[role="main"]')
@@ -479,6 +532,8 @@
       const ok = await clickDelete()
       if (!ok) throw new Error('Delete button not found')
 
+      await confirmBulkIfNeeded()
+
       console.log('[subs] clicked delete for all conversations')
       await sleep(STEP_DELAY)
     } else {
@@ -489,6 +544,8 @@
       while (keepGoing) {
         const ok = await clickDelete()
         if (!ok) throw new Error('Delete button not found')
+
+        await confirmBulkIfNeeded()
 
         console.log(`[subs] clicked delete on page ${page}`)
         await sleep(STEP_DELAY)
